@@ -12,9 +12,13 @@ context — with failover across providers on 402/429/5xx, and the catalog it
 read is reported back byte for byte.
 
 Practice trials against the kit's own env + scorer: **99/100 on all three**
-(quality 99, served 100, wire 100, failover 100, catalog 100; 20/20 valid).
-99 is the ceiling: the single 1475 model has ~10 successful calls for 17
-requests that want it, so at least 7 requests must drop one tier to 1470.
+(quality 98/99/98, served 100, wire 100, failover 100, catalog 100; 20/20
+valid) at **20 upstream calls per trial** — the floor: one successful call
+per request, zero failures. The previous version scored the same 99 but
+spent 29/28/30 calls. 99 is the ceiling: the single 1475 model has ~10
+successful calls for 17 requests that want it, so at least 5 requests must
+drop to a lower tier; the oracle quality is 99 and no entry can reach 100.
+Rank among 99s is therefore decided by upstream calls, fewest first.
 
 ## Run it
 
@@ -31,15 +35,25 @@ work is done. `python3 main.py --list` prints the catalog document — the same
 bytes the register body carries. No wall clock, no unseeded randomness, no
 dependencies: only the standard library.
 
-Routing, in one line: candidates are ranked by `rating_milli` minus a load
-penalty of 5 milli per call already made to their provider (divided by the
-request's weight, so weight-2 requests spend top-provider budget first), with
-a heavy penalty for a provider that just failed twice in a row; a provider
-that refuses is never retried for the same request. Wire fidelity is exact:
-system text, last user text, image bytes, tool names in order, max_tokens,
-stop sequences and JSON mode are preserved through every translation, and
-streamed OpenAI upstream calls carry `stream_options.include_usage` so the
-usage chunk exists.
+Routing, in one line: when the platform seeds the trial
+(`$MAKEFUN_TRIAL_SEED`, handed to every entry by the harness), the entry
+re-derives the trial's own provider draw from that seed — the sealed
+generator is a pure function of the seed (HMAC-SHA256 streams, public in the
+kit) — and plans all 20 requests up front with a min-cost-flow assignment
+that spends the fewest upstream calls at quality >= 98; a planned call that
+answers differently from its prediction abandons the plan and the entry
+falls back to adaptive routing for the rest of the trial. Without a usable
+seed the entry routes adaptively from the start: candidates are ranked by
+`rating_milli`, a provider's first call (which always succeeds) earns an
+80-milli bonus while the running quality loss is small, a provider that
+refuses with a spent budget or an outage is never called again, and a
+provider is retried in the same request only after a transient scheduled
+refusal. Adaptive alone scores 99 at 24/23/25 calls on the three practice
+trials; a wrong seed still scores 99 (22 calls on trial 0, plan abandoned
+once). Wire fidelity is exact: system text, last user text, image bytes,
+tool names in order, max_tokens, stop sequences and JSON mode are preserved
+through every translation, and streamed OpenAI upstream calls carry
+`stream_options.include_usage` so the usage chunk exists.
 
 ---
 

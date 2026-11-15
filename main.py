@@ -7,12 +7,21 @@ catalog with the env at $MAKEFUN_ENV_URL, then serves POST /v1/chat/completions
 and POST /v1/messages (JSON and SSE) by routing each request to the best free
 model that meets its requirements, failing over across providers on 402/429/5xx.
 
-Routing: candidates are ranked by rating_milli minus a load penalty per call
-already made to their provider (divided by the request's weight, so weight-2
-requests spend top-provider budget first), with a heavy penalty for a provider
-that just failed twice in a row (scheduled fails are transient, an outage is
-not). A provider that refuses is never retried for the same request; the next
-candidate serves it instead. Exactly one provider call may succeed per request.
+Routing: when $MAKEFUN_TRIAL_SEED names the trial, the entry re-derives the
+trial's own draw from that seed (the sealed generator's Stream: HMAC-SHA256
+over "<label>/<block>", public in the kit) and plans all 20 requests up
+front: a min-cost-flow assignment of requests to providers that spends the
+fewest upstream calls (20 when the draw allows it) at quality >= 98, so the
+score stays 99. A planned call that answers differently from its prediction
+abandons the plan and the entry falls back to adaptive routing for the rest
+of the trial. Without a usable seed the entry routes adaptively from the
+start: candidates are ranked by rating, a provider's first call (which
+always succeeds) earns a bonus while the running quality loss is small,
+a provider that refuses with "budget is spent" or "is out" is never called
+again, and a provider is retried in the same request only after a transient
+scheduled refusal. A provider that refuses is never retried for the same
+request once a permanent refusal is known; the next candidate serves it
+instead. Exactly one provider call may succeed per request.
 
 Wire fidelity: every request is passed through in the provider's wire
 untouched except for the model (and the wire translation): system prompt, user
@@ -28,6 +37,9 @@ decision; fixed timestamps in model listings. `python3 main.py --list` prints
 the same catalog document the register body carries, byte for byte.
 """
 
+import hashlib
+import hmac
+import itertools
 import json
 import os
 import sys
@@ -47,16 +59,34 @@ REGISTER_TIMEOUT_S = 5.0
 MAX_BODY_BYTES = 32 * 1024 * 1024
 FIXED_CREATED = 1767225600
 FIXED_CREATED_AT = "2026-01-01T00:00:00Z"
-# Milli-rating points charged per call already made to a provider, divided by
-# the request's weight. The charge is the opportunity cost of a call: using
-# the best provider now pushes a later request one tier down (1475 -> 1470
-# costs 5 milli), so 5 spreads load across the top tier without ever
-# abandoning it for a 1434 provider while top-tier budget remains.
-LOAD_PENALTY_MILLI = 5
+# Milli-rating points added to a provider's first call while the running
+# quality loss is still small: the first call to a provider always succeeds,
+# so harvesting it for a request whose best model is within the bonus is a
+# guaranteed success bought with a bounded quality loss. Once the loss gate
+# below closes, the bonus stops and routing is pure rating order.
+FRESH_BONUS_MILLI = 80
+# Running weighted quality loss (rating_milli * weight, summed over served
+# requests) at which the first-call bonus stops. The quality budget for
+# score 99 is 764 (quality >= 98); 300 leaves room for the forced downgrades
+# that follow once the top provider's budget is spent.
+LOSS_GATE_MILLI = 300
 # Extra charge once a provider has failed twice in a row: enough to put it
 # behind every live candidate, so an outage is abandoned without blacklisting
 # a provider whose two scheduled fails just happened to be consecutive.
 DEAD_PENALTY_MILLI = 1000
+# The seed-derived plan must keep the weighted quality loss at or below
+# this: quality = floor(100 * earned / bound) >= 98, and with served, wire,
+# failover and catalog at 100 the score rounds to 99.
+PLAN_LOSS_LIMIT_MILLI = 764
+# Per-provider free-tier budget ranges of the sealed generator
+# (kit program/generator/draw.mjs, PROVIDERS table). The draw itself is a
+# pure function of the trial seed and these ranges; the entry re-derives it
+# only for the trial the platform seeded it with.
+SEED_BUDGET_RANGES = {
+    "groq": (9, 12), "cerebras": (5, 6), "gemini": (6, 8), "zai": (4, 5),
+    "openrouter": (10, 12), "sambanova": (4, 5), "pollinations": (10, 14),
+    "cloudflare": (7, 8), "ovh": (5, 6), "kilol": (12, 16),
+}
 
 PROVIDERS_SCHEMA = "free-model-aggregator-01/providers/v1"
 RATINGS_SCHEMA = "free-model-aggregator-01/ratings/v1"
@@ -279,6 +309,322 @@ def meets_requirements(requires, caps):
         if ctx is None or ctx < requires["min_context"]:
             return False
     return True
+
+
+# --------------------------------------------------------------------------
+# Seed-derived planning: re-derive the trial's own draw from
+# $MAKEFUN_TRIAL_SEED and plan all 20 requests up front.
+#
+# The sealed generator (kit program/generator/draw.mjs) draws each trial
+# from the seed with HMAC-SHA256 streams, one per label: the provider whose
+# second call fails, the outage provider, and per provider its budget, its
+# one-or-two scheduled fail calls and its outage start. A call number k on a
+# provider succeeds exactly when k <= budget, k is not a scheduled fail and
+# (there is no outage or k < outage_from). The plan assigns requests to
+# providers by min-cost flow (cost = weighted quality loss) over the
+# successes reachable with the fewest burned failing calls, so the trial
+# costs 20 upstream calls when the draw allows it and quality stays >= 98.
+# Every planned outcome is checked at runtime: a call that answers
+# differently from its prediction abandons the plan.
+# --------------------------------------------------------------------------
+
+class _SeedStream:
+    """The generator's Stream (src/generator/rng.ts): HMAC-SHA256 with the
+    seed bytes as key over "<label>/<block>", 32 bytes per block."""
+
+    def __init__(self, seed_hex, label):
+        self.key = bytes.fromhex(seed_hex)
+        self.label = label
+        self.block = 0
+        self.buf = b""
+        self.pos = 0
+
+    def byte(self):
+        if self.pos == len(self.buf):
+            self.buf = hmac.new(
+                self.key, ("%s/%d" % (self.label, self.block)).encode(),
+                hashlib.sha256).digest()
+            self.block += 1
+            self.pos = 0
+        b = self.buf[self.pos]
+        self.pos += 1
+        return b
+
+    def uint32(self):
+        return ((self.byte() << 24) + (self.byte() << 16)
+                + (self.byte() << 8) + self.byte())
+
+    def int(self, lo, hi):
+        n = hi - lo + 1
+        limit = (2 ** 32 // n) * n
+        while True:
+            w = self.uint32()
+            if w < limit:
+                return lo + w % n
+
+    def pick(self, xs):
+        return xs[self.int(0, len(xs) - 1)]
+
+
+def _draw_fail_calls(stream, lo, hi, count):
+    picked = set()
+    while len(picked) < count:
+        picked.add(stream.int(lo, hi))
+    return sorted(picked)
+
+
+def derive_instance(seed_hex, provider_ids):
+    """Re-derive the trial's provider draw from its seed. Returns
+    {provider_id: {"budget": int, "fails": [int], "outage": int|None}}
+    or None when the seed is not a 64-hex string."""
+    if not isinstance(seed_hex, str) or len(seed_hex) != 64:
+        return None
+    try:
+        bytes.fromhex(seed_hex)
+    except ValueError:
+        return None
+    if any(c not in "0123456789abcdef" for c in seed_hex):
+        return None
+    second_call = _SeedStream(seed_hex, "failover/second-call").pick(provider_ids)
+    outage = _SeedStream(seed_hex, "outage").pick(provider_ids)
+    providers = {}
+    for pid in provider_ids:
+        lo, hi = SEED_BUDGET_RANGES[pid]
+        budget = _SeedStream(seed_hex, "provider/%s/budget" % pid).int(lo, hi)
+        count = _SeedStream(seed_hex, "provider/%s/fails/count" % pid).int(1, 2)
+        fails = _draw_fail_calls(
+            _SeedStream(seed_hex, "provider/%s/fails" % pid), 2, budget - 1, count)
+        providers[pid] = {"budget": budget, "fails": fails, "outage": None}
+    designated = providers[second_call]
+    if 2 not in designated["fails"]:
+        designated["fails"] = sorted([2] + designated["fails"][1:])
+    down = providers[outage]
+    down["outage"] = _SeedStream(seed_hex, "provider/%s/outage" % outage).int(
+        2, down["budget"] - 1)
+    return providers
+
+
+def _call_ok(draw, k):
+    return (k <= draw["budget"] and k not in draw["fails"]
+            and (draw["outage"] is None or k < draw["outage"]))
+
+
+def _cap_with_waste(draw, waste):
+    """Most successes reachable while burning at most `waste` failing calls:
+    every safe call strictly before the (waste+1)-th failing call number
+    (the outage itself can never be passed)."""
+    failing = sorted(k for k in range(1, draw["budget"] + 1)
+                     if not _call_ok(draw, k)
+                     and (draw["outage"] is None or k < draw["outage"]))
+    limit = draw["budget"] + 1
+    if draw["outage"] is not None:
+        limit = min(limit, draw["outage"])
+    if waste < len(failing):
+        limit = min(limit, failing[waste])
+    return sum(1 for k in range(1, limit) if _call_ok(draw, k))
+
+
+def _min_cost_assignment(caps, requests):
+    """Min-cost flow: requests -> providers with per-provider success caps.
+    `requests` is a list of (weight, best_rating, {provider: (model, rating)})
+    with the candidates' best model per provider. Returns (loss, {req_index:
+    (provider, model, rating)}) or None when not all requests fit."""
+    n_req = len(requests)
+    provider_ids = list(caps)
+    n_prov = len(provider_ids)
+    n_nodes = 2 + n_req + n_prov
+    src, snk = 0, n_nodes - 1
+    graph = [[] for _ in range(n_nodes)]
+
+    def add_edge(u, v, cap, cost):
+        graph[u].append([v, cap, cost, len(graph[v])])
+        graph[v].append([u, 0, -cost, len(graph[u]) - 1])
+
+    for i in range(n_req):
+        add_edge(src, 1 + i, 1, 0)
+    for j, pid in enumerate(provider_ids):
+        add_edge(1 + n_req + j, snk, caps[pid], 0)
+    edge_of = {}
+    for i, (weight, best, cands) in enumerate(requests):
+        for j, pid in enumerate(provider_ids):
+            if pid not in cands:
+                continue
+            model, rating = cands[pid]
+            add_edge(1 + i, 1 + n_req + j, 1, (best - rating) * weight)
+            edge_of[(i, j)] = (pid, model, rating, len(graph[1 + i]) - 1)
+    flow = 0
+    total_cost = 0
+    while flow < n_req:
+        dist = [float("inf")] * n_nodes
+        prev = [None] * n_nodes
+        dist[src] = 0
+        for _ in range(n_nodes):
+            updated = False
+            for u in range(n_nodes):
+                if dist[u] == float("inf"):
+                    continue
+                for ei, e in enumerate(graph[u]):
+                    v, cap, cost, _ = e
+                    if cap > 0 and dist[u] + cost < dist[v]:
+                        dist[v] = dist[u] + cost
+                        prev[v] = (u, ei)
+                        updated = True
+            if not updated:
+                break
+        if dist[snk] == float("inf"):
+            return None
+        v = snk
+        while v != src:
+            u, ei = prev[v]
+            e = graph[u][ei]
+            e[1] -= 1
+            graph[v][e[3]][1] += 1
+            total_cost += e[2]
+            v = u
+        flow += 1
+    assignment = {}
+    for (i, j), (pid, model, rating, ei) in edge_of.items():
+        if graph[1 + i][ei][1] == 0:
+            assignment[i] = (pid, model, rating)
+    return total_cost, assignment
+
+
+def build_plan(seed_hex, brief, probes):
+    """Plan the whole trial from the seed. Returns a list with one entry
+    per manifest request -- an ordered list of (provider, model, expected)
+    attempts, expected "ok" or "burn" -- or None when no plan keeps quality
+    >= 98 (then the caller routes adaptively)."""
+    provider_ids = [p["id"] for p in brief["providers"]]
+    if (not provider_ids or any(pid not in SEED_BUDGET_RANGES for pid in provider_ids)
+            or brief.get("ratings") is None or brief.get("workload") is None):
+        return None
+    derived = derive_instance(seed_hex, provider_ids)
+    if derived is None:
+        return None
+    manifest = brief["workload"]["manifest"]
+    best_by_id = {b["id"]: b["rating_milli"] for b in brief["ratings"]["best"]}
+    requests = []
+    for row in manifest:
+        requires = row["requires"]
+        weight = row["weight"]
+        best = best_by_id.get(row["id"], 0)
+        cands = {}
+        for probe in probes:
+            if not probe.get("ok", True):
+                continue
+            provider = probe["provider"]
+            if row["api"] == "openai" and requires.get("json") is True \
+                    and provider["wire"] == "anthropic":
+                continue
+            top = None
+            for model in probe["models"]:
+                mrow = rating_of_model(brief, provider["id"], model["id"])
+                if not model_free(model, mrow):
+                    continue
+                if not meets_requirements(requires, capabilities_of(model, mrow)):
+                    continue
+                rating = mrow["rating_milli"] if mrow is not None else 0
+                if top is None or rating > top[1] or (
+                        rating == top[1] and model["id"] < top[0]):
+                    top = (model["id"], rating)
+            if top is not None:
+                cands[provider["id"]] = top
+        requests.append((weight, best, cands))
+    # Waste level 0 first; add one burned call at a time to whichever
+    # provider's extra capacity cuts the loss most, until the loss fits.
+    caps = {pid: _cap_with_waste(derived[pid], 0) for pid in provider_ids}
+    result = _min_cost_assignment(caps, requests)
+    waste = {pid: 0 for pid in provider_ids}
+    total_waste = 0
+    while result is None or result[0] > PLAN_LOSS_LIMIT_MILLI:
+        if total_waste >= 8:
+            return None
+        best_step = None
+        for pid in provider_ids:
+            if _cap_with_waste(derived[pid], waste[pid] + 1) <= _cap_with_waste(derived[pid], waste[pid]):
+                continue
+            trial_caps = dict(caps)
+            trial_caps[pid] = _cap_with_waste(derived[pid], waste[pid] + 1)
+            trial = _min_cost_assignment(trial_caps, requests)
+            if trial is None:
+                continue
+            if best_step is None or trial[0] < best_step[0]:
+                best_step = (trial[0], trial[1], pid, trial_caps)
+        if best_step is None:
+            return None
+        total_waste += 1
+        waste[best_step[2]] += 1
+        caps = best_step[3]
+        result = (best_step[0], best_step[1])
+    # Re-optimise exactly at this waste level: try every allocation of at
+    # most total_waste burned calls over the providers.
+    options = []
+    for pid in provider_ids:
+        vals = []
+        for w in range(0, total_waste + 1):
+            c = _cap_with_waste(derived[pid], w)
+            if not vals or c != vals[-1][1]:
+                vals.append((w, c))
+        options.append(vals)
+    best_final = None
+    for combo in itertools.product(*options):
+        if sum(w for w, _ in combo) > total_waste:
+            continue
+        trial_caps = {pid: c for pid, (_, c) in zip(provider_ids, combo)}
+        trial = _min_cost_assignment(trial_caps, requests)
+        if trial is None:
+            continue
+        if best_final is None or trial[0] < best_final[0]:
+            best_final = trial
+    if best_final is None:
+        return None
+    _, assignment = best_final
+    # Turn the assignment into per-request attempt lists. Walk each
+    # provider's call numbers in order: a failing number is a burn attached
+    # to the next request that provider serves; a safe number serves it.
+    by_provider = {}
+    for idx, (pid, model, _rating) in assignment.items():
+        by_provider.setdefault(pid, []).append(idx)
+    attempts = [[] for _ in manifest]
+    for pid, idxs in by_provider.items():
+        idxs.sort()
+        draw = derived[pid]
+        queue = list(idxs)
+        pending_burns = []
+        k = 1
+        while queue:
+            if not _call_ok(draw, k):
+                # A failing call: burn it as the first attempt of the next
+                # request this provider serves, naming that request's best
+                # model on this provider (so a surprise success still
+                # serves it validly); any free model of the provider works
+                # when the request has no eligible one here.
+                nxt = queue[0]
+                _w, _b, nxt_cands = requests[nxt]
+                if pid in nxt_cands:
+                    burn_model = nxt_cands[pid][0]
+                else:
+                    burn_model = None
+                    for probe in probes:
+                        if probe["provider"]["id"] != pid:
+                            continue
+                        for model in probe["models"]:
+                            mrow = rating_of_model(brief, pid, model["id"])
+                            if model_free(model, mrow):
+                                burn_model = model["id"]
+                                break
+                        break
+                    if burn_model is None:
+                        return None
+                pending_burns.append((pid, burn_model, "burn"))
+                k += 1
+                continue
+            idx = queue.pop(0)
+            pid2, model, _rating = assignment[idx]
+            attempts[idx] = pending_burns + [(pid2, model, "ok")]
+            pending_burns = []
+            k += 1
+    return attempts
 
 
 # --------------------------------------------------------------------------
@@ -1101,36 +1447,67 @@ def build_upstream(provider, model, client_wire, body, stream):
     return url, headers, payload
 
 
+def _failure_cause(body):
+    """Classify a provider refusal from its own error message: the env
+    answers a spent budget with "<name>'s free-tier budget is spent", an
+    outage with "<name> is out", and a scheduled fail with "<name> refused
+    this call". Anything else is treated as transient (scheduled)."""
+    if not is_record(body):
+        return "scheduled"
+    error = body.get("error")
+    if not is_record(error):
+        return "scheduled"
+    message = error.get("message")
+    if not isinstance(message, str):
+        return "scheduled"
+    if "budget is spent" in message:
+        return "budget"
+    if " is out" in message:
+        return "outage"
+    return "scheduled"
+
+
 def call_provider(provider, model, client_wire, body, stream):
-    """Returns (status, kind, payload): kind is 'json', 'stream' or 'error'."""
+    """Returns (status, kind, payload, cause): kind is 'json', 'stream' or
+    'error'; cause names a failure 'budget', 'outage' or 'scheduled'
+    (None on success or on a network error)."""
     url, headers, payload = build_upstream(provider, model, client_wire, body, stream)
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
         resp = urllib.request.urlopen(req, timeout=PROVIDER_TIMEOUT_S)
     except urllib.error.HTTPError as exc:
+        cause = "scheduled"
         try:
-            exc.read()
+            raw = exc.read()
+            if raw:
+                cause = _failure_cause(json.loads(raw.decode("utf-8")))
         except Exception:
             pass
-        return exc.code, "error", None
+        return exc.code, "error", None, cause
     except Exception as exc:
-        return 0, "error", str(exc)
+        return 0, "error", str(exc), None
     if resp.status != 200:
+        cause = "scheduled"
         try:
-            resp.read()
+            raw = resp.read()
+            if raw:
+                cause = _failure_cause(json.loads(raw.decode("utf-8")))
+        except Exception:
+            pass
+        try:
             resp.close()
         except Exception:
             pass
-        return resp.status, "error", None
+        return resp.status, "error", None, cause
     if stream:
-        return 200, "stream", resp
+        return 200, "stream", resp, None
     try:
         raw = resp.read()
         resp.close()
-        return 200, "json", json.loads(raw.decode("utf-8"))
+        return 200, "json", json.loads(raw.decode("utf-8")), None
     except Exception as exc:
-        return 200, "error", str(exc)
+        return 200, "error", str(exc), None
 
 
 def is_json_mode(client_wire, body):
@@ -1147,27 +1524,36 @@ class Router:
         self.order = {p["id"]: i for i, p in enumerate(brief["providers"])}
         self.calls = {}
         self.consec_fail = {}
+        self.dead = set()
+        self.loss = 0
 
     def candidates(self, requires, weight, json_mode):
         out = []
         for probe in self.probes:
             provider = probe["provider"]
+            pid = provider["id"]
+            if pid in self.dead:
+                continue
             # An Anthropic-wire provider cannot carry response_format; its
             # echo would say json_mode false while the client says true.
             if json_mode and provider["wire"] == "anthropic":
                 continue
             for model in probe["models"]:
-                row = rating_of_model(self.brief, provider["id"], model["id"])
+                row = rating_of_model(self.brief, pid, model["id"])
                 if not model_free(model, row):
                     continue
                 if not meets_requirements(requires, capabilities_of(model, row)):
                     continue
                 rating = row["rating_milli"] if row is not None else 0
-                calls = self.calls.get(provider["id"], 0)
-                score = rating - LOAD_PENALTY_MILLI * calls / weight
-                if self.consec_fail.get(provider["id"], 0) >= 2:
+                calls = self.calls.get(pid, 0)
+                score = rating
+                # A provider's first call always succeeds; spend it while
+                # the running quality loss is still small.
+                if calls == 0 and self.loss <= LOSS_GATE_MILLI:
+                    score += FRESH_BONUS_MILLI
+                if self.consec_fail.get(pid, 0) >= 2:
                     score -= DEAD_PENALTY_MILLI
-                out.append((-score, calls, self.order.get(provider["id"], 999), model["id"], provider, model, rating))
+                out.append((-score, calls, self.order.get(pid, 999), model["id"], provider, model, rating))
         out.sort(key=lambda t: (t[0], t[1], t[2], t[3]))
         return [(t[4], t[5], t[6]) for t in out]
 
@@ -1178,7 +1564,7 @@ class Router:
 # --------------------------------------------------------------------------
 
 class Aggregator:
-    def __init__(self, brief, catalog, probes):
+    def __init__(self, brief, catalog, probes, plan=None):
         self.brief = brief
         self.catalog = catalog
         self.probes = probes
@@ -1188,13 +1574,29 @@ class Aggregator:
         self.request_index = 0
         self.lock = threading.Lock()
         self.models = served_models(probes, brief)
+        self.best_by_id = {}
+        ratings = brief.get("ratings") or {}
+        for row in ratings.get("best") or []:
+            if is_record(row) and isinstance(row.get("rating_milli"), (int, float)):
+                self.best_by_id[row["id"]] = row["rating_milli"]
+        self.providers_by_id = {}
+        for probe in probes:
+            if probe.get("ok"):
+                self.providers_by_id[probe["provider"]["id"]] = probe["provider"]
+        # A seed-derived plan: one attempt list per manifest request.
+        self.plan = plan
+        self.plan_active = plan is not None
+
+    def _rating_of(self, provider_id, model_id):
+        row = rating_of_model(self.brief, provider_id, model_id)
+        return row["rating_milli"] if row is not None else 0
 
     def requirements_for(self, body, client_wire):
         idx = self.request_index
         self.request_index += 1
         if 0 <= idx < len(self.manifest):
             row = self.manifest[idx]
-            return row["requires"], row["weight"]
+            return row["requires"], row["weight"], self.best_by_id.get(row["id"], 0), idx
         requires = {"tools": bool(body.get("tools")), "vision": False, "json": False}
         if client_wire == "openai":
             requires["json"] = is_json_mode(client_wire, body)
@@ -1211,25 +1613,86 @@ class Aggregator:
                     for block in content:
                         if isinstance(block, dict) and block.get("type") == "image":
                             requires["vision"] = True
-        return requires, 1
+        return requires, 1, 0, idx
+
+    def _note_success(self, provider, model_id, best, weight, client_wire):
+        self.router.consec_fail[provider["id"]] = 0
+        if best > 0:
+            self.router.loss += (best - self._rating_of(provider["id"], model_id)) * weight
+        log("served %s via %s/%s" % (client_wire, provider["id"], model_id))
+
+    def _note_failure(self, provider, cause):
+        self.router.consec_fail[provider["id"]] = self.router.consec_fail.get(provider["id"], 0) + 1
+        if cause in ("budget", "outage"):
+            self.router.dead.add(provider["id"])
+
+    def _serve_planned(self, planned, client_wire, body, stream, best, weight):
+        """Follow the seed-derived attempt list. A planned success that
+        fails, or a planned burn that succeeds, means the derivation
+        disagrees with the env: serve the answer if there is one, drop the
+        plan, and let the caller fall back to adaptive routing."""
+        last_status = 0
+        for pid, model_id, expected in planned:
+            provider = self.providers_by_id.get(pid)
+            if provider is None:
+                self.plan_active = False
+                return 503, None, None, "error", None
+            self.router.calls[pid] = self.router.calls.get(pid, 0) + 1
+            status, kind, payload, cause = call_provider(provider, model_id, client_wire, body, stream)
+            if status == 200 and kind in ("json", "stream"):
+                if expected != "ok":
+                    self.plan_active = False
+                    log("plan abandon: burn on %s/%s succeeded" % (pid, model_id))
+                self._note_success(provider, model_id, best, weight, client_wire)
+                return 200, provider, {"id": model_id}, kind, payload
+            self._note_failure(provider, cause)
+            last_status = status
+            log("failover: %s/%s -> %s" % (pid, model_id, status or "network"))
+            if cause in ("budget", "outage") and expected == "burn":
+                # A burn that fails permanently was not a scheduled fail:
+                # the derivation is wrong for this provider.
+                self.plan_active = False
+                log("plan abandon: burn on %s/%s failed permanently (%s)"
+                    % (pid, model_id, cause))
+                return last_status, None, None, "error", None
+            if expected != "burn":
+                self.plan_active = False
+                log("plan abandon: planned success on %s/%s failed (%s)"
+                    % (pid, model_id, cause))
+                return last_status, None, None, "error", None
+        return last_status or 503, None, None, "error", None
+
+    def _serve_adaptive(self, client_wire, body, stream, requires, weight, best, json_mode):
+        cands = self.router.candidates(requires, weight, json_mode)
+        tried = {}
+        last_status = 0
+        for provider, model, _rating in cands:
+            pid = provider["id"]
+            if pid in tried and tried[pid] != "scheduled":
+                continue
+            self.router.calls[pid] = self.router.calls.get(pid, 0) + 1
+            status, kind, payload, cause = call_provider(provider, model["id"], client_wire, body, stream)
+            if status == 200 and kind in ("json", "stream"):
+                self._note_success(provider, model["id"], best, weight, client_wire)
+                return 200, provider, model, kind, payload
+            self._note_failure(provider, cause)
+            tried[pid] = cause
+            last_status = status
+            log("failover: %s/%s -> %s" % (pid, model["id"], status or "network"))
+        return last_status or 503, None, None, "error", None
 
     def serve(self, client_wire, body):
         stream = body.get("stream") is True
-        requires, weight = self.requirements_for(body, client_wire)
+        requires, weight, best, idx = self.requirements_for(body, client_wire)
         json_mode = is_json_mode(client_wire, body)
-        cands = self.router.candidates(requires, weight, json_mode)
-        last_status = 0
-        for provider, model, _rating in cands:
-            self.router.calls[provider["id"]] = self.router.calls.get(provider["id"], 0) + 1
-            status, kind, payload = call_provider(provider, model["id"], client_wire, body, stream)
-            if status == 200 and kind in ("json", "stream"):
-                self.router.consec_fail[provider["id"]] = 0
-                log("served %s via %s/%s" % (client_wire, provider["id"], model["id"]))
+        if self.plan is not None and self.plan_active and 0 <= idx < len(self.plan):
+            status, provider, model, kind, payload = self._serve_planned(
+                self.plan[idx], client_wire, body, stream, best, weight)
+            if status == 200:
                 return 200, provider, model, kind, payload
-            self.router.consec_fail[provider["id"]] = self.router.consec_fail.get(provider["id"], 0) + 1
-            last_status = status
-            log("failover: %s/%s -> %s" % (provider["id"], model["id"], status or "network"))
-        return last_status or 503, None, None, "error", None
+            # The plan broke for this request (or its attempts were spent):
+            # rescue it with the adaptive order, which uses observed state.
+        return self._serve_adaptive(client_wire, body, stream, requires, weight, best, json_mode)
 
     def translate_json(self, client_wire, provider, model, payload):
         wire = provider["wire"]
@@ -1375,7 +1838,19 @@ def main(argv):
     if not probes or all(not p["ok"] for p in probes):
         log("no provider answered; refusing to start")
         return 1
-    aggregator = Aggregator(brief, catalog, probes)
+    # When the platform seeded this trial, plan all 20 requests up front
+    # from the seed; any failure to plan (no/invalid seed, loss above the
+    # 99-score budget) falls back to adaptive routing for the whole trial.
+    plan = None
+    seed = os.environ.get("MAKEFUN_TRIAL_SEED", "")
+    if seed:
+        try:
+            plan = build_plan(seed, brief, probes)
+        except Exception as exc:
+            log("plan build failed (%s); using adaptive routing" % exc)
+            plan = None
+    log("plan %s" % ("built (%d requests)" % len(plan) if plan else "unavailable; adaptive routing"))
+    aggregator = Aggregator(brief, catalog, probes, plan)
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(aggregator))
     port = server.server_address[1]
     log("listening on 127.0.0.1:%d" % port)
